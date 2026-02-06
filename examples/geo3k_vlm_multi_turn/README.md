@@ -27,17 +27,17 @@ The reward model is the default math RM.
 ## Reproduce
 ```bash
 # 1) Set environment variable
-export WANDB_API_KEY=...
+export WANDB_API_KEY=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
 export SLIME_SCRIPT_MODEL_NAME=Qwen3-VL-2B-Instruct
-export SLIME_SCRIPT_NUM_GPUS=4
+export SLIME_SCRIPT_NUM_GPUS=2
 export SLIME_SCRIPT_TRAIN_BACKEND=fsdp
 
 # 2) Download the dataset
 hf download --repo-type dataset VeraIsHere/geo3k_imgurl_processed --local-dir /root/datasets/geo3k_imgurl_processed
 
-# 3) Run the script:
+# 3) Run the script (logs to geo3k_vlm.log, runs in background):
 cd /root/slime
-python examples/geo3k_vlm_multi_turn/run_geo3k_vlm_multi_turn.py
+nohup python examples/geo3k_vlm_multi_turn/run_geo3k_vlm_multi_turn.py > geo3k_vlm_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
 ## What each file does

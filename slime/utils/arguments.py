@@ -1212,6 +1212,37 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            # gpu-profile and request-profile
+            parser.add_argument(
+                "--enable-gpu-profile",
+                action="store_true",
+                default=False,
+                help="Enable GPU profile (per-step, per-worker latencies) and request-profile (request count per GPU).",
+            )
+            parser.add_argument(
+                "--gpu-profile-plot-steps",
+                type=int,
+                default=30,
+                help="Emit gpu-profile report every this many rollout steps (default: 30).",
+            )
+            parser.add_argument(
+                "--gpu-profile-output-dir",
+                type=str,
+                default=None,
+                help="Directory for gpu-profile output (default: GPU_PROFILE_DIR or ./gpu_profile).",
+            )
+            parser.add_argument(
+                "--gpu-profile-heatmap-steps",
+                type=int,
+                default=20,
+                help="Number of steps for gpu-profile heatmap (default: 20).",
+            )
+            parser.add_argument(
+                "--enable-inference-profile",
+                action="store_true",
+                default=False,
+                help="Record SGLang inference events (prefill/decode/unified) to inference_profile.jsonl when the engine returns timing in meta_info (e.g. first_token_time, total_time or prefill_*_sec, decode_*_sec).",
+            )
             return parser
 
         def add_network_arguments(parser):
