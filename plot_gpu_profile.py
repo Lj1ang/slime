@@ -27,7 +27,7 @@ _DEFAULT_LOG_DIR = _REPO_ROOT / "log"
 
 
 def load_profile_record(jsonl_path: Path):
-    """Load the first record that has both utilization samples and request times."""
+    """Load the first record that has utilization samples and (optionally) request times. Rollout-only records have utilization but no request_times."""
     records = []
     with open(jsonl_path) as f:
         for line in f:
@@ -42,12 +42,12 @@ def load_profile_record(jsonl_path: Path):
         samples = rec["gpu_profile/gpu_utilization_samples"]
         if not samples:
             continue
-        # Find request_times for any GPU
+        # Require request_times unless this is a rollout-window-only record
         gpu_request_keys = [k for k in rec if re.match(r"gpu_profile/gpu\d+_request_times", k)]
-        if not gpu_request_keys:
+        if not gpu_request_keys and not rec.get("gpu_profile/rollout_window_only"):
             continue
         return rec
-    raise ValueError(f"No record with gpu_utilization_samples and gpu*_request_times in {jsonl_path}")
+    raise ValueError(f"No record with gpu_utilization_samples (and gpu*_request_times or rollout_window_only) in {jsonl_path}")
 
 
 def get_num_gpus(rec: dict) -> int:
@@ -125,12 +125,79 @@ EVENT_CATEGORIES = [
     ("unified_times", "unified", "tab:green"),
 ]
 
+OTHER_LABEL = "other (GPU busy)"
+OTHER_COLOR = (0.85, 0.85, 0.85)  # light gray
+
+
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merge overlapping (start, end) intervals."""
+    if not intervals:
+        return []
+    sorted_i = sorted(intervals, key=lambda x: x[0])
+    merged = [list(sorted_i[0])]
+    for s, e in sorted_i[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [tuple(m) for m in merged]
+
+
+def _gaps_in_range(merged: list[tuple[float, float]], x_min: float, x_max: float) -> list[tuple[float, float]]:
+    """Return (start, end) gaps inside [x_min, x_max] not covered by merged intervals."""
+    out = []
+    current = x_min
+    for s, e in merged:
+        if e <= current:
+            continue
+        if s > current:
+            out.append((current, min(s, x_max)))
+        current = max(current, e)
+        if current >= x_max:
+            break
+    if current < x_max:
+        out.append((current, x_max))
+    return out
+
 
 def draw_request_timeline_ax(rec: dict, t0: float, ax: plt.Axes, x_range: tuple[float, float] | None) -> None:
-    """Draw request timeline on given axes. Uses x_range if provided. Draws all event categories (ref_log_probs, log_probs, train_step) with different colors."""
+    """Draw request timeline on given axes. Uses x_range if provided. Draws all event categories (ref_log_probs, log_probs, train_step) with different colors. Fills time not attributed to any event as 'other (GPU busy)' when GPU utilization is present."""
     num_gpus = get_num_gpus(rec)
     if num_gpus == 0:
         return
+
+    x_min, x_max = (0.0, 0.0)
+    if x_range is not None:
+        x_min, x_max = x_range
+
+    # Per-GPU: collect all known event intervals (relative time)
+    intervals_per_gpu: list[list[tuple[float, float]]] = [[] for _ in range(num_gpus)]
+    for key_suffix, _label, _color in EVENT_CATEGORIES:
+        for gpu in range(num_gpus):
+            key = f"gpu_profile/gpu{gpu}_{key_suffix}"
+            if key not in rec:
+                continue
+            for start, end in rec[key]:
+                start_rel = normalize_time(start, t0)
+                end_rel = normalize_time(end, t0)
+                intervals_per_gpu[gpu].append((start_rel, end_rel))
+
+    # Draw "other" (unaccounted) segments first so they sit behind the labeled events
+    legend_used_other = False
+    if x_range is not None and x_max > x_min:
+        bar_height = 0.4
+        for gpu in range(num_gpus):
+            merged = _merge_intervals(intervals_per_gpu[gpu])
+            gaps = _gaps_in_range(merged, x_min, x_max)
+            y_center = num_gpus - 1 - gpu
+            for start_rel, end_rel in gaps:
+                if end_rel - start_rel < 0.01:
+                    continue
+                legend_used_other = True
+                ax.barh(
+                    y_center, end_rel - start_rel, left=start_rel, height=bar_height,
+                    color=OTHER_COLOR, edgecolor=(0.7, 0.7, 0.7), linewidth=0.2,
+                )
 
     all_ends = []
     legend_used = set()
@@ -182,6 +249,10 @@ def draw_request_timeline_ax(rec: dict, t0: float, ax: plt.Axes, x_range: tuple[
         for (key_suffix, label, color) in EVENT_CATEGORIES
         if (label, color) in legend_used
     ]
+    if legend_used_other:
+        legend_elements.append(
+            Line2D([0], [0], color=OTHER_COLOR, linewidth=8, label=OTHER_LABEL),
+        )
     legend_elements.append(
         Line2D([0], [0], color="black", linewidth=1, linestyle="-", label="request start/end"),
     )

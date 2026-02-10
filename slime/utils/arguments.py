@@ -1217,7 +1217,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--enable-gpu-profile",
                 action="store_true",
                 default=False,
-                help="Enable GPU profile (per-step, per-worker latencies) and request-profile (request count per GPU).",
+                help="Enable GPU profile limited to SGLang rollout: utilization during rollout window and fine-grained rollout events (prefill/decode/unified).",
             )
             parser.add_argument(
                 "--gpu-profile-plot-steps",
@@ -1238,10 +1238,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Number of steps for gpu-profile heatmap (default: 20).",
             )
             parser.add_argument(
+                "--gpu-profile-rollout-events",
+                action="store_true",
+                default=True,
+                help="Record fine-grained rollout events (prefill/decode/unified per request) for the request timeline. Default True when --enable-gpu-profile. Implies --enable-inference-profile.",
+            )
+            parser.add_argument(
+                "--no-gpu-profile-rollout-events",
+                action="store_false",
+                dest="gpu_profile_rollout_events",
+                help="Disable fine-grained rollout event recording.",
+            )
+            parser.add_argument(
                 "--enable-inference-profile",
                 action="store_true",
                 default=False,
-                help="Record SGLang inference events (prefill/decode/unified) to inference_profile.jsonl when the engine returns timing in meta_info (e.g. first_token_time, total_time or prefill_*_sec, decode_*_sec).",
+                help="Record SGLang inference events (prefill/decode/unified) to inference_profile.jsonl when the engine returns timing in meta_info. Auto-enabled when --enable-gpu-profile and --gpu-profile-rollout-events (default).",
             )
             return parser
 
@@ -1764,6 +1776,11 @@ def slime_validate_args(args):
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
     )
+
+    # GPU profile: enable fine-grained rollout events (inference profile)
+    if getattr(args, "enable_gpu_profile", False):
+        if getattr(args, "gpu_profile_rollout_events", True):
+            args.enable_inference_profile = True
 
     # always true on offload for colocate at the moment.
     if args.colocate:

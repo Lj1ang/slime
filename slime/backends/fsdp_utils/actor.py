@@ -614,6 +614,13 @@ class FSDPTrainRayActor(TrainRayActor):
                         if self._gpu_util_collector is not None
                         else None
                     )
+                    rollout_time_window = rollout_data.get("gpu_profile_rollout_time_window")
+                    if rollout_time_window is not None:
+                        # Only log GPU utilization during SGLang rollout window; omit training request/event times
+                        request_count_per_rank = None
+                        latency_per_rank = None
+                        request_times_per_rank = None
+                        event_times_per_rank_by_type = None
                     run_gpu_profile_report(
                         self._gpu_profiler,
                         self.args,
@@ -626,6 +633,7 @@ class FSDPTrainRayActor(TrainRayActor):
                         request_times_per_rank=request_times_per_rank,
                         gpu_utilization_samples=gpu_util_samples,
                         event_times_per_rank_by_type=event_times_per_rank_by_type or None,
+                        rollout_time_window=rollout_time_window,
                     )
                 self._gpu_profiler.clear()
 

@@ -173,8 +173,10 @@ def log_request_profile_metrics(
     request_times_per_rank: list[list[RequestTime]] | None = None,
     gpu_utilization_samples: list[tuple[float, list[int]]] | None = None,
     event_times_per_rank_by_type: dict[str, list[list[RequestTime]]] | None = None,
+    rollout_time_window: tuple[float, float] | None = None,
 ) -> None:
-    """Log request-profile metrics: per-request (start_time, end_time) per GPU, request counts, optional GPU utilization, and optional per-event-type times (e.g. log_probs, ref_log_probs)."""
+    """Log request-profile metrics: per-request (start_time, end_time) per GPU, request counts, optional GPU utilization, and optional per-event-type times (e.g. log_probs, ref_log_probs).
+    When rollout_time_window (start_sec, end_sec) is provided, only GPU utilization samples within that window are included (for SGLang rollout-only profiling)."""
     from slime.utils import logging_utils
 
     step_key = "rollout/step"
@@ -182,6 +184,8 @@ def log_request_profile_metrics(
         "gpu_profile/interval_ms": 200,
         step_key: step_key_value,
     }
+    if rollout_time_window is not None:
+        log_dict["gpu_profile/rollout_window_only"] = True
     if request_count_per_rank is not None:
         for rank, count in enumerate(request_count_per_rank):
             log_dict[f"request_profile/requests_gpu{rank}"] = count
@@ -201,10 +205,14 @@ def log_request_profile_metrics(
                 if times:
                     log_dict[f"gpu_profile/gpu{rank}_{key_suffix}"] = [[s, e] for s, e in times]
     if gpu_utilization_samples is not None and gpu_utilization_samples:
-        # Each entry: (timestamp_sec, [util_pct for gpu0, gpu1, ...])
-        log_dict["gpu_profile/gpu_utilization_samples"] = [[t, utils] for t, utils in gpu_utilization_samples]
-        log_dict["gpu_profile/gpu_utilization_start_sec"] = gpu_utilization_samples[0][0]
-        log_dict["gpu_profile/gpu_utilization_end_sec"] = gpu_utilization_samples[-1][0]
+        if rollout_time_window is not None:
+            t_start, t_end = rollout_time_window
+            gpu_utilization_samples = [(t, utils) for t, utils in gpu_utilization_samples if t_start <= t <= t_end]
+        if gpu_utilization_samples:
+            # Each entry: (timestamp_sec, [util_pct per gpu0, gpu1, ...])
+            log_dict["gpu_profile/gpu_utilization_samples"] = [[t, utils] for t, utils in gpu_utilization_samples]
+            log_dict["gpu_profile/gpu_utilization_start_sec"] = gpu_utilization_samples[0][0]
+            log_dict["gpu_profile/gpu_utilization_end_sec"] = gpu_utilization_samples[-1][0]
 
     logging_utils.log(args, log_dict, step_key=step_key)
 
@@ -231,11 +239,13 @@ def run_gpu_profile_report(
     request_times_per_rank: list[list[RequestTime]] | None = None,
     gpu_utilization_samples: list[tuple[float, list[int]]] | None = None,
     event_times_per_rank_by_type: dict[str, list[list[RequestTime]]] | None = None,
+    rollout_time_window: tuple[float, float] | None = None,
 ) -> None:
     """
     Log gpu-profile and request-profile metrics at report cadence.
     Call from rank 0. Per-request (start_sec, end_sec) are recorded per step; GPU utilization sampled every 200 ms.
     event_times_per_rank_by_type: optional dict of event_type -> list of (start, end) per rank for extra categories (e.g. log_probs, ref_log_probs).
+    rollout_time_window: when set (e.g. for --gpu-profile-rollout-only), only GPU utilization within (start_sec, end_sec) is logged; training request/event times are omitted.
     """
     log_request_profile_metrics(
         args,
@@ -245,6 +255,7 @@ def run_gpu_profile_report(
         request_times_per_rank,
         gpu_utilization_samples,
         event_times_per_rank_by_type=event_times_per_rank_by_type,
+        rollout_time_window=rollout_time_window,
     )
 
 
