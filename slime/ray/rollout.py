@@ -66,6 +66,9 @@ class RolloutManager:
             self.custom_convert_samples_to_train_data_func = load_function(
                 self.args.custom_convert_samples_to_train_data_path
             )
+        self.custom_vine_branch_generate_func = None
+        if getattr(self.args, "custom_vine_branch_generate_path", None) is not None:
+            self.custom_vine_branch_generate_func = load_function(self.args.custom_vine_branch_generate_path)
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
@@ -397,7 +400,61 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if self.args.advantage_estimator == "vine":
+            self._populate_vine_v_hat(samples, train_data)
+
         return train_data
+
+    def _populate_vine_v_hat(self, samples: list, train_data: dict) -> None:
+        """Populate ``train_data['vine_v_hat_per_token']`` for VinePPO.
+
+        Branch-rollout dispatch is engine-specific, so the actual generation is
+        delegated to a user-supplied callable wired via
+        ``--custom-vine-branch-generate-path``. The callable receives
+        (args, samples, branch_prompt_ids) and must return a list of scalar
+        rewards, one per branch prompt, after generating to completion and
+        scoring.
+        """
+        from slime.utils.vine import (
+            assemble_v_hat_per_token,
+            group_mean_baseline,
+            run_branch_rollouts,
+        )
+
+        if self.custom_vine_branch_generate_func is None:
+            raise RuntimeError(
+                "advantage_estimator=vine requires --custom-vine-branch-generate-path "
+                "pointing to a function with signature "
+                "fn(args, samples, branch_prompt_ids) -> list[float]."
+            )
+
+        prompt_token_ids = [sample.tokens[: -sample.response_length] for sample in samples]
+        response_token_ids = [sample.tokens[-sample.response_length :] for sample in samples]
+        rewards_t = torch.tensor(train_data["rewards"], dtype=torch.float32)
+        group_indices = [sample.group_index for sample in samples]
+        fallback = group_mean_baseline(rewards_t, group_indices)
+
+        def _branch_generate_fn(branch_prompt_ids):
+            return self.custom_vine_branch_generate_func(self.args, samples, branch_prompt_ids)
+
+        v_hat, boundaries_per_rollout, vine_metrics = run_branch_rollouts(
+            prompt_token_ids=prompt_token_ids,
+            response_token_ids=response_token_ids,
+            tokenizer=self.data_source.tokenizer if hasattr(self.data_source, "tokenizer") else None,
+            branch_generate_fn=_branch_generate_fn,
+            num_branches=self.args.vine_num_branches,
+            step_separators=self.args.vine_step_separators,
+            max_branches_per_rollout=self.args.vine_max_branches_per_rollout,
+        )
+
+        v_hat_per_token = assemble_v_hat_per_token(
+            v_hat=v_hat,
+            boundaries_per_rollout=boundaries_per_rollout,
+            response_lengths=train_data["response_lengths"],
+            fallback_per_rollout=fallback,
+        )
+        train_data["vine_v_hat_per_token"] = v_hat_per_token
+        train_data["vine_metrics"] = vine_metrics
 
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config

@@ -520,6 +520,27 @@ class FSDPTrainRayActor(TrainRayActor):
                 torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
                 for i in range(len(rollout_data["rewards"]))
             ]
+        elif self.args.advantage_estimator == "vine":
+            from slime.utils.vine import compute_vine_advantage
+
+            v_hat_per_token = rollout_data.get("vine_v_hat_per_token")
+            if v_hat_per_token is None:
+                raise RuntimeError(
+                    "VinePPO requires 'vine_v_hat_per_token' in rollout_data. "
+                    "Was the branch-rollout pass run before training?"
+                )
+            rewards = torch.tensor(rollout_data["rewards"], dtype=torch.float32)
+            loss_masks = [
+                torch.ones(rollout_data["response_lengths"][i], dtype=torch.float32)
+                for i in range(len(rewards))
+            ]
+            advantages, returns = compute_vine_advantage(
+                rewards=rewards,
+                v_hat_per_token=[v.float() for v in v_hat_per_token],
+                loss_masks=loss_masks,
+            )
+            rollout_data["advantages"] = advantages
+            rollout_data["returns"] = returns
         else:
             raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
 
