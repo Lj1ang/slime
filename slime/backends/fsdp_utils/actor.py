@@ -23,6 +23,9 @@ from slime.utils.ppo_utils import compute_approx_kl, compute_gspo_kl, compute_op
 from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.profile_utils import TrainProfiler
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
+# Profiling components: Profiler is per-rank state (request and event timings),
+# GpuUtilizationCollector is rank-0-only background nvidia-smi sampler, and
+# run_gpu_profile_report fans the gathered data into wandb + JSONL on report cadence.
 from slime.utils.profiler import (
     EVENT_LOG_PROBS,
     EVENT_REF_LOG_PROBS,
@@ -89,6 +92,10 @@ class FSDPTrainRayActor(TrainRayActor):
         self._gpu_profiler = None
         self._gpu_util_collector = None
         # enable_gpu_profile: request-profile (per-request times) + GPU utilization sampling every 200 ms (rank 0 only)
+        # Profiler instances live on every rank (each records its own ranks's events) but
+        # the GPU-utilization collector lives only on rank 0 — nvidia-smi sees the whole
+        # node, so duplicating the collector on every rank would just waste subprocess
+        # invocations. Rank 0 also owns the gather + write at report time.
         if getattr(args, "enable_gpu_profile", False):
             self._gpu_profiler = Profiler(num_workers=self.dp_size)
             if dist.get_rank() == 0:
@@ -530,6 +537,10 @@ class FSDPTrainRayActor(TrainRayActor):
         ), f"Invalid grad_accum {grad_accum} for micro_batch_size {self.args.micro_batch_size} and global_batch_size {self.args.global_batch_size}"
 
         if self.ref_model is not None:
+            # cuda.synchronize bracketing the log-prob span: _compute_log_prob enqueues
+            # GPU work but returns before it finishes, so without a sync the timestamps
+            # would only bound the dispatch path, not the actual GPU duration. Skipping
+            # the sync when profiling is disabled keeps the no-op cost at zero.
             if self._gpu_profiler is not None:
                 torch.cuda.synchronize()
                 _ref_log_probs_start = time.time()
@@ -540,6 +551,9 @@ class FSDPTrainRayActor(TrainRayActor):
                     rollout_id, self.dp_rank, _ref_log_probs_start, time.time(), EVENT_REF_LOG_PROBS
                 )
 
+        # Same sync-bracket pattern for the actor log-prob span. Recorded as a separate
+        # event_type from train_step so the plotter can colour ref / actor / train phases
+        # distinctly without inferring categories from durations.
         if self._gpu_profiler is not None:
             torch.cuda.synchronize()
             _log_probs_start = time.time()
@@ -567,6 +581,14 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.prof.step(rollout_id=rollout_id)
 
+        # Periodic gather + report. Every plot_steps rollouts (default 30):
+        #   1. all_gather_object pulls each rank's (samples_dict, request_count) into rank 0;
+        #   2. rank 0 splits flattened events into train_step vs categorical event_types;
+        #   3. rank 0 calls run_gpu_profile_report which writes to wandb + gpu_profile.jsonl;
+        #   4. every rank clears its local Profiler buffer to keep memory bounded.
+        # all_gather_object is collective — every rank must enter, even though the report
+        # writing is rank-0-only. Hence the `if dist.get_rank() == 0` lives inside the
+        # outer `(rollout_id + 1) % plot_steps == 0` block, not around the gather.
         if self._gpu_profiler is not None:
             plot_steps = getattr(self.args, "gpu_profile_plot_steps", 30)
             if (rollout_id + 1) % plot_steps == 0:
@@ -578,7 +600,10 @@ class FSDPTrainRayActor(TrainRayActor):
                 )
                 if dist.get_rank() == 0:
                     request_count_per_rank = [all_data[i][1] for i in range(dist.get_world_size())]
-                    # Flatten events: each event is (start, end) or (start, end, event_type)
+                    # Flatten events: each event is (start, end) or (start, end, event_type).
+                    # The 2-tuple shape is the legacy format (untyped train_step); the 3-tuple
+                    # form is what Profiler.record() emits today. We accept both so a mid-run
+                    # upgrade doesn't lose the older buffered events.
                     world_size = dist.get_world_size()
                     request_times_per_rank = []
                     event_times_per_rank_by_type = {}
@@ -596,6 +621,8 @@ class FSDPTrainRayActor(TrainRayActor):
                             if event_type == "train_step":
                                 train_step_times.append((start_sec, end_sec))
                             else:
+                                # Lazy-initialize the per-event_type bucket so the report only
+                                # emits keys for categories that actually appeared.
                                 if event_type not in event_times_per_rank_by_type:
                                     event_times_per_rank_by_type[event_type] = [
                                         [] for _ in range(world_size)
@@ -614,6 +641,11 @@ class FSDPTrainRayActor(TrainRayActor):
                         if self._gpu_util_collector is not None
                         else None
                     )
+                    # Rollout-only mode: data["gpu_profile_rollout_time_window"] flows in
+                    # from RolloutManager._get_rollout_data via slime/ray/rollout.py. When
+                    # present, we keep ONLY the GPU-utilization samples within that window
+                    # and drop training-request times — the user wants to see what
+                    # happened during SGLang inference, not training.
                     rollout_time_window = rollout_data.get("gpu_profile_rollout_time_window")
                     if rollout_time_window is not None:
                         # Only log GPU utilization during SGLang rollout window; omit training request/event times
@@ -635,6 +667,8 @@ class FSDPTrainRayActor(TrainRayActor):
                         event_times_per_rank_by_type=event_times_per_rank_by_type or None,
                         rollout_time_window=rollout_time_window,
                     )
+                # Clear on EVERY rank (not just rank 0) so memory stays bounded across
+                # all ranks. The non-zero ranks have already shipped their data via gather.
                 self._gpu_profiler.clear()
 
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
@@ -653,6 +687,8 @@ class FSDPTrainRayActor(TrainRayActor):
             self.ref_model.cpu()
 
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum, rollout_id: int):
+        # rollout_id is threaded down from the caller solely so the profiler can key the
+        # event by (rollout, dp_rank). Functionally unused in the train step itself.
         # Record this request's time slot (start)
         if self._gpu_profiler is not None:
             torch.cuda.synchronize()
@@ -829,7 +865,9 @@ class FSDPTrainRayActor(TrainRayActor):
                 logging_utils.log(self.args, log_dict, step_key="train/step")
             self.global_step += 1
 
-        # Record this request's time slot (end)
+        # Record this request's time slot (end). No event_type passed -> defaults to
+        # EVENT_TRAIN_STEP, which is the only category that bumps _request_count and
+        # appears in the request_profile/requests_gpu<N> totals.
         if self._gpu_profiler is not None:
             torch.cuda.synchronize()
             _request_end_sec = time.time()

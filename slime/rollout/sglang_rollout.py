@@ -43,8 +43,20 @@ def _record_inference_profile_if_present(
     request_start_sec: float,
     meta_info: dict,
 ) -> None:
-    """If meta_info contains SGLang inference timing, write one line to inference_profile.jsonl."""
+    """If meta_info contains SGLang inference timing, write one line to inference_profile.jsonl.
+
+    Two timing schemes are accepted from SGLang's response meta_info:
+      (a) explicit phase boundaries: prefill_start_sec / prefill_end_sec / decode_*_sec /
+          unified_*_sec — used as-is when present;
+      (b) duration shorthand: first_token_time (prefill duration in sec) + total_time
+          (end-to-end). The fallback below derives absolute timestamps from these by
+          anchoring at request_start_sec, since the plotter wants wall-clock pairs.
+    SGLang upstream currently only reports (b), so the explicit-boundary branch is mostly
+    forward-looking — code intentionally accepts both to avoid a breaking change.
+    """
     mi = meta_info
+    # gpu_id is taken modulo num_gpus so that even when the rollout is sharded across more
+    # logical workers than GPUs, every event still lands on a real GPU lane in the plot.
     num_gpus = getattr(args, "sglang_dp_size", None) or getattr(args, "rollout_num_gpus", 1)
     gpu_id = getattr(state, "dp_rank", 0) % num_gpus
     # Support explicit phase boundaries (when SGLang adds them)
@@ -57,6 +69,10 @@ def _record_inference_profile_if_present(
     # Fallback: use first_token_time and total_time (durations in sec) if present
     first_tt = mi.get("first_token_time")  # time to first token (prefill duration)
     total_t = mi.get("total_time")  # end-to-end duration
+    # Derivation: prefill_end = request_start + first_token_time;
+    #             decode_start = prefill_end (no inter-phase gap is reported);
+    #             decode_end = request_start + total_time.
+    # If only some of these are present we leave the rest None and skip them below.
     if prefill_end is None and first_tt is not None:
         prefill_end = request_start_sec + float(first_tt)
     if decode_start is None and prefill_end is not None:
@@ -65,6 +81,9 @@ def _record_inference_profile_if_present(
         decode_end = request_start_sec + float(total_t)
     if unified_start is not None and unified_end is not None:
         pass  # use as-is
+    # Build the per-rank list-of-lists shape the plotter consumes: outer index = gpu rank,
+    # inner = list of (start, end) pairs. We only place this request's pair on `gpu_id`,
+    # leaving the other rank slots empty — the plotter merges across rollouts to fill them.
     events = {}
     if prefill_end is not None and prefill_start is not None:
         prefill_per_rank = [[] for _ in range(num_gpus)]
@@ -81,6 +100,8 @@ def _record_inference_profile_if_present(
     if not events:
         return
     step = getattr(state, "rollout_step", 0)
+    # __import__ is used inline to avoid adding a top-level `import os` since this is the
+    # only os reference in the file. Equivalent to `os.environ.get(...)`.
     log_dir = getattr(args, "gpu_profile_output_dir", None) or __import__("os").environ.get("GPU_PROFILE_DIR", "log")
     write_inference_profile(events, step_key_value=step, log_dir=log_dir, t0_sec=request_start_sec)
 
@@ -246,7 +267,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     sample.update_from_meta_info(args, output["meta_info"])
 
-    # Optional: record SGLang inference profile (prefill/decode/unified) when enabled and meta_info has timing
+    # Optional: record SGLang inference profile (prefill/decode/unified) when enabled and meta_info has timing.
+    # enable_inference_profile is auto-set to True by slime_validate_args() whenever
+    # --enable-gpu-profile is on (default rollout-events behaviour). Lives at request scope
+    # so failures inside the helper don't break the rollout — _record_inference_profile_if_present
+    # silently returns when meta_info has no usable timing fields.
     if getattr(args, "enable_inference_profile", False) and output.get("meta_info"):
         _record_inference_profile_if_present(args, state, request_start_sec, output["meta_info"])
 

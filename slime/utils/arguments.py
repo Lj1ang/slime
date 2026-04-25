@@ -1212,7 +1212,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
-            # gpu-profile and request-profile
+            # gpu-profile and request-profile.
+            # The flag group below adds GPU/request profiling on top of slime's existing
+            # `TrainProfiler`. --enable-gpu-profile is the master switch; it implies
+            # --enable-inference-profile via slime_validate_args() because the SGLang
+            # rollout-event recorder is the source of truth for prefill/decode timestamps.
+            # Output goes to <gpu-profile-output-dir>/gpu_profile.jsonl (actor-side aggregate)
+            # and ./inference_profile.jsonl (per-request rollout events).
             parser.add_argument(
                 "--enable-gpu-profile",
                 action="store_true",
@@ -1777,7 +1783,12 @@ def slime_validate_args(args):
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
     )
 
-    # GPU profile: enable fine-grained rollout events (inference profile)
+    # GPU profile: enable fine-grained rollout events (inference profile).
+    # Why force-set rather than expose two independent flags: the actor-side profile relies
+    # on the rollout-side writer for prefill/decode timestamps. Letting the user enable
+    # --enable-gpu-profile without --enable-inference-profile would silently produce a
+    # report missing the inference timeline. The --no-gpu-profile-rollout-events escape
+    # hatch keeps users in control: setting it disables this auto-on path.
     if getattr(args, "enable_gpu_profile", False):
         if getattr(args, "gpu_profile_rollout_events", True):
             args.enable_inference_profile = True

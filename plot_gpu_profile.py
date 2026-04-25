@@ -8,6 +8,13 @@ Usage (script lives in repo root; profile files in log/ by default):
   python plot_gpu_profile.py --input log/gpu_profile.jsonl --inference-profile log/inference_profile.jsonl
 
 With --inference-profile, merges SGLang inference events (prefill, decode, unified) into the timeline.
+
+Output: a single PNG (gpu_profile.png) with two stacked panels sharing an x-axis:
+  - top:    GPU utilization heatmap (rows = GPUs, cells = 200 ms util %, RdYlGn colormap)
+  - bottom: per-request timeline bars per GPU, coloured by event type, with grey "other"
+            fill for any GPU-busy time not attributed to a known event.
+The script reads only the first record in the JSONL that has both utilization and (request
+times OR rollout_window_only) — slime appends one such record every plot_steps rollouts.
 """
 
 import argparse
@@ -115,7 +122,13 @@ def draw_gpu_utilization_ax(
 
 
 # Event categories for request timeline (key suffix in gpu_profile.jsonl, display label, color)
-# Training (actor) events first, then SGLang inference events when --inference-profile is used
+# Training (actor) events first, then SGLang inference events when --inference-profile is used.
+# Order matters because draw_request_timeline_ax draws bars in iteration order, so train_step
+# (orange, many short bars) deliberately renders LAST so it sits on top of the broader
+# log_probs / prefill spans. Two categories share the same colour intentionally:
+# log_probs and prefill (both blue), train_step and decode (both orange) — the actor and
+# inference profiles are never drawn for the same GPU lane in practice (actor profile vs
+# rollout profile cover disjoint time windows).
 EVENT_CATEGORIES = [
     ("ref_log_probs_times", "ref_log_probs", "tab:cyan"),
     ("log_probs_times", "log_probs", "tab:blue"),
@@ -125,12 +138,18 @@ EVENT_CATEGORIES = [
     ("unified_times", "unified", "tab:green"),
 ]
 
+# "other" fills every gap between known events that overlaps GPU-busy time. This makes
+# unaccounted CUDA work visible (e.g. communication waits, optimizer step, dataloading
+# stalls) without requiring it to be instrumented explicitly.
 OTHER_LABEL = "other (GPU busy)"
 OTHER_COLOR = (0.85, 0.85, 0.85)  # light gray
 
 
 def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """Merge overlapping (start, end) intervals."""
+    # Standard linear-sweep merge after sort: O(n log n). Used to collapse all known event
+    # spans on a single GPU into one coverage list, so _gaps_in_range can compute "what
+    # time is not accounted for" in a single pass.
     if not intervals:
         return []
     sorted_i = sorted(intervals, key=lambda x: x[0])
@@ -293,7 +312,15 @@ def draw_combined(rec: dict, t0: float, output_path: Path, window_duration_sec: 
 
 
 def load_and_merge_inference_profile(rec: dict, inference_path: Path) -> None:
-    """Merge inference_profile.jsonl (SGLang prefill/decode/unified) into rec in-place."""
+    """Merge inference_profile.jsonl (SGLang prefill/decode/unified) into rec in-place.
+
+    inference_profile.jsonl is appended once per request (see
+    slime/rollout/sglang_rollout.py:_record_inference_profile_if_present), whereas rec is
+    a single aggregated record from gpu_profile.jsonl. The merge concatenates per-(gpu,
+    event_type) lists across all requests, then takes the minimum t0_sec to anchor the
+    merged events on the earliest-seen request — keeps the relative timeline accurate
+    even when SGLang served requests across multiple plot_steps windows.
+    """
     if not inference_path.exists():
         return
     t0_candidates = []
@@ -303,6 +330,8 @@ def load_and_merge_inference_profile(rec: dict, inference_path: Path) -> None:
             if not line:
                 continue
             row = json.loads(line)
+            # Strict filter: only lines tagged inference_profile=True are merged. Mixed
+            # files would otherwise contaminate the actor record with rollout-only events.
             if not row.get("gpu_profile/inference_profile"):
                 continue
             if "gpu_profile/inference_t0_sec" in row:
@@ -310,6 +339,8 @@ def load_and_merge_inference_profile(rec: dict, inference_path: Path) -> None:
             for key in row:
                 if not key.startswith("gpu_profile/gpu") or "_times" not in key:
                     continue
+                # Append rather than replace: each line carries one request's events on
+                # one GPU, and we want every request to show up as a separate bar.
                 if key in rec:
                     rec[key] = rec[key] + row[key]
                 else:
