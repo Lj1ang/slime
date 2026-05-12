@@ -819,12 +819,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
+                    "vine",
                 ],
                 default="grpo",
                 help=(
                     "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
                     "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator."
                 ),
+            )
+            parser.add_argument(
+                "--vine-num-branches",
+                type=int,
+                default=8,
+                help="VinePPO: number of branch rollouts per step boundary (K').",
+            )
+            parser.add_argument(
+                "--vine-step-separators",
+                type=str,
+                nargs="+",
+                default=["\n"],
+                help="VinePPO: suffix strings that mark a reasoning-step end (used to find boundaries).",
+            )
+            parser.add_argument(
+                "--vine-max-branches-per-rollout",
+                type=int,
+                default=16,
+                help="VinePPO: cap on boundaries per rollout; if exceeded, boundaries are uniformly subsampled.",
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -1321,6 +1341,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The function should have the signature `def convert_samples_to_train_data(args, samples) -> dict`."
                 ),
             )
+            parser.add_argument(
+                "--custom-vine-branch-generate-path",
+                type=str,
+                default=None,
+                help=(
+                    "VinePPO: path to a function that runs branch rollouts and returns scalar rewards. "
+                    "Signature: `def vine_branch_generate(args, samples, branch_prompt_ids) -> list[float]`. "
+                    "Required when --advantage-estimator=vine."
+                ),
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):
@@ -1710,6 +1740,14 @@ def slime_validate_args(args):
             "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
+
+    if args.advantage_estimator == "vine":
+        assert args.custom_vine_branch_generate_path is not None, (
+            "advantage_estimator=vine requires --custom-vine-branch-generate-path. "
+            "Provide a function with signature fn(args, samples, branch_prompt_ids) -> list[float]."
+        )
+        assert args.vine_num_branches >= 1, "--vine-num-branches must be >= 1"
+        assert args.vine_max_branches_per_rollout >= 1, "--vine-max-branches-per-rollout must be >= 1"
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."

@@ -351,6 +351,24 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         )
         returns = advantages
 
+    elif args.advantage_estimator == "vine":
+        from slime.utils.vine import compute_vine_advantage
+
+        v_hat_per_token = rollout_data.get("vine_v_hat_per_token")
+        if v_hat_per_token is None:
+            raise RuntimeError(
+                "VinePPO requires 'vine_v_hat_per_token' in rollout_data. "
+                "Was the branch-rollout pass run before compute_advantages_and_returns?"
+            )
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
+        v_hat_per_token = [v.to(kl[0].device, dtype=torch.float32) for v in v_hat_per_token]
+        loss_masks_f = [m.to(kl[0].device, dtype=torch.float32) for m in loss_masks]
+        advantages, returns = compute_vine_advantage(
+            rewards=rewards,
+            v_hat_per_token=v_hat_per_token,
+            loss_masks=loss_masks_f,
+        )
+
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
