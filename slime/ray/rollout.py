@@ -133,10 +133,16 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        data, metrics, rollout_time_window = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = self._convert_samples_to_train_data(data)
+        # Stamp the (start, end) of the rollout into the train payload only when GPU
+        # profiling is on. The FSDP actor reads this from rollout_data to clip GPU-util
+        # samples to the rollout window (rollout-only profile mode). Gating on
+        # enable_gpu_profile keeps the train payload small in the common non-profile path.
+        if rollout_time_window is not None and getattr(self.args, "enable_gpu_profile", False):
+            data["gpu_profile_rollout_time_window"] = rollout_time_window
         return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
 
     def eval(self, rollout_id):
@@ -212,6 +218,11 @@ class RolloutManager:
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
     def _get_rollout_data(self, rollout_id):
+        # rollout_time_window is None on the debug-load path (data wasn't actually generated
+        # this run, so a window is meaningless); it's a (start, end) tuple wrapping the
+        # call_rollout_fn span on the live path. Returned to .generate() which forwards it
+        # to the FSDP actor for window-clipped GPU-utilization profiling.
+        rollout_time_window = None  # (start_sec, end_sec) for SGLang rollout only
         if self.args.load_debug_rollout_data:
             data = torch.load(
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
@@ -227,7 +238,10 @@ class RolloutManager:
                 )
             metrics = None
         else:
+            rollout_start_sec = time.time()
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+            rollout_end_sec = time.time()
+            rollout_time_window = (rollout_start_sec, rollout_end_sec)
             metrics = data.metrics
             data = data.samples
             # flatten the data if it is a list of lists
@@ -251,7 +265,7 @@ class RolloutManager:
                     logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
                 logger.info(f"Final collected {len(data)} samples from rollout to train")
 
-        return data, metrics
+        return data, metrics, rollout_time_window
 
     def _compute_dynamic_global_batch_size(self, num_samples: int) -> int:
         """Calculate dynamic global_batch_size to ensure only one training step.
@@ -446,6 +460,11 @@ class RolloutManager:
             # Pass dynamic global_batch_size to training side
             if hasattr(self, "_dynamic_global_batch_size"):
                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
+            # Forward the rollout time window to every DP partition's payload. The window
+            # is the same for all partitions (it bounds the whole rollout call), but each
+            # train-side actor reads it from its own rollout_data, so we duplicate it here.
+            if "gpu_profile_rollout_time_window" in data:
+                rollout_data["gpu_profile_rollout_time_window"] = data["gpu_profile_rollout_time_window"]
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
 

@@ -63,10 +63,10 @@ def execute():
         "--custom-generate-function-path examples.geo3k_vlm_multi_turn.rollout.generate "
         "--custom-config-path examples/geo3k_vlm_multi_turn/geo3k_vlm_multi_turn_config.yaml "
         "--rollout-shuffle "
-        "--num-rollout 3000 "
+        "--num-rollout 1 "
         "--rollout-batch-size 64 "
         "--n-samples-per-prompt 8 "
-        "--rollout-max-response-len 4096 "
+        "--rollout-max-response-len 20000 "
         "--rollout-temperature 1 "
         "--global-batch-size 512 "
     )
@@ -102,6 +102,8 @@ def execute():
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-mem-fraction-static 0.6 "
         f"--sglang-cuda-graph-bs {' '.join(map(str, [1, 2, 4, 8] + list(range(16, 257, 8))))} "
+        "--sglang-attention-backend fa3 "
+        "--enable-gpu-profile "
     )
 
     fsdp_args = (
@@ -115,7 +117,8 @@ def execute():
     megatron_args = (
         "--train-backend megatron "
         f"--load /root/models/{MODEL_NAME} "
-        "--tensor-model-parallel-size 4 "
+        #"--ckpt-step 499 "
+        "--tensor-model-parallel-size 2 "
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
         "--context-parallel-size 1 "
@@ -138,6 +141,12 @@ def execute():
         "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {NUM_GPUS} " f"--rollout-num-gpus {NUM_GPUS} " "--colocate "
     )
 
+    profile_args = (
+        "--enable-gpu-profile "
+        "--gpu-profile-plot-steps 1 "
+        "--enable-inference-profile "
+    )
+
     if TRAIN_BACKEND == "megatron":
         backend_args = megatron_args
         megatron_model_type = get_megatron_model_type(MODEL_NAME)
@@ -154,6 +163,7 @@ def execute():
         f"{sglang_args} "
         f"{backend_args} "
         f"{misc_args} "
+        f"{profile_args} "
         f"{wandb_args} "
         # f"{get_default_wandb_args(__file__)} "
     )

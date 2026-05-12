@@ -1212,6 +1212,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            # gpu-profile and request-profile.
+            # The flag group below adds GPU/request profiling on top of slime's existing
+            # `TrainProfiler`. --enable-gpu-profile is the master switch; it implies
+            # --enable-inference-profile via slime_validate_args() because the SGLang
+            # rollout-event recorder is the source of truth for prefill/decode timestamps.
+            # Output goes to <gpu-profile-output-dir>/gpu_profile.jsonl (actor-side aggregate)
+            # and ./inference_profile.jsonl (per-request rollout events).
+            parser.add_argument(
+                "--enable-gpu-profile",
+                action="store_true",
+                default=False,
+                help="Enable GPU profile limited to SGLang rollout: utilization during rollout window and fine-grained rollout events (prefill/decode/unified).",
+            )
+            parser.add_argument(
+                "--gpu-profile-plot-steps",
+                type=int,
+                default=30,
+                help="Emit gpu-profile report every this many rollout steps (default: 30).",
+            )
+            parser.add_argument(
+                "--gpu-profile-output-dir",
+                type=str,
+                default=None,
+                help="Directory for gpu-profile output (default: GPU_PROFILE_DIR or ./gpu_profile).",
+            )
+            parser.add_argument(
+                "--gpu-profile-heatmap-steps",
+                type=int,
+                default=20,
+                help="Number of steps for gpu-profile heatmap (default: 20).",
+            )
+            parser.add_argument(
+                "--gpu-profile-rollout-events",
+                action="store_true",
+                default=True,
+                help="Record fine-grained rollout events (prefill/decode/unified per request) for the request timeline. Default True when --enable-gpu-profile. Implies --enable-inference-profile.",
+            )
+            parser.add_argument(
+                "--no-gpu-profile-rollout-events",
+                action="store_false",
+                dest="gpu_profile_rollout_events",
+                help="Disable fine-grained rollout event recording.",
+            )
+            parser.add_argument(
+                "--enable-inference-profile",
+                action="store_true",
+                default=False,
+                help="Record SGLang inference events (prefill/decode/unified) to inference_profile.jsonl when the engine returns timing in meta_info. Auto-enabled when --enable-gpu-profile and --gpu-profile-rollout-events (default).",
+            )
             return parser
 
         def add_network_arguments(parser):
@@ -1733,6 +1782,16 @@ def slime_validate_args(args):
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
     )
+
+    # GPU profile: enable fine-grained rollout events (inference profile).
+    # Why force-set rather than expose two independent flags: the actor-side profile relies
+    # on the rollout-side writer for prefill/decode timestamps. Letting the user enable
+    # --enable-gpu-profile without --enable-inference-profile would silently produce a
+    # report missing the inference timeline. The --no-gpu-profile-rollout-events escape
+    # hatch keeps users in control: setting it disables this auto-on path.
+    if getattr(args, "enable_gpu_profile", False):
+        if getattr(args, "gpu_profile_rollout_events", True):
+            args.enable_inference_profile = True
 
     # always true on offload for colocate at the moment.
     if args.colocate:
